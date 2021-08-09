@@ -1,0 +1,148 @@
+#YAML манифест для тестового задания MindBox
+# Create namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mindbox
+# Create deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mindbox-deployment
+  namespace: mindbox
+  labels:
+    app: mindbox
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mindbox
+  template:
+    metadata:
+      labels:
+        app: mindbox
+    spec:
+      # For HA we should not run all pods in one zone (>v1.19 k8s)
+      # Before applying manifests we should label all workers according to a zone
+      topologySpreadConstraints:
+      - maxSkew: 1
+        # Based on zone label on workers
+        topologyKey: zone
+        # Schedule second pod to zone, if all zones have at least 1 pod
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: mindbox
+      containers:
+      - name: mindbox
+        image: mindbox:v1.0.0
+        ports:
+        # Endpoint in application, to detect if it is ready to serve
+        - name: startup-port
+          containerPort: 8080
+        # Listening port for incoming requests
+        - name: app-port
+          containerPort: 8000
+        # Startup Probe due to long app initialization
+        # Some endpoint in app, to check if it is ready to serve
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: liveness-port
+          # 5-10 seconds to start with max to 15s
+          failureThreshold: 3
+          periodSeconds: 5
+        resources:
+      # Normal resources consumption
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+      # Max resources consumption, if more -> OOM Killer
+      limits:
+        memory: "256Mi"
+        cpu: "200m"
+---
+# Role, role binding and sa for changing replicas in deployment
+# Since we don't know if cpu or memory consumption is rising due to load, we can't use hpa
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa-cron-runner
+  namespace: mindbox
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  namespace: mindbox
+  name: cron-runner
+rules:
+- apiGroups: ["apps","extensions"]
+  resources: ["deployments"]
+  verbs: ["patch", "get"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: cron-runner
+  namespace: mindbox
+subjects:
+- kind: ServiceAccount
+  name: sa-cron-runner
+  namespace: mindbox
+roleRef:
+  kind: Role
+  name: cron-runner
+  apiGroup: rbac.authorization.k8s.io
+---
+# CronJob for scaling up deployment on dayloads
+# Since cpu and RAM consumption during dayload is not defined in test case
+# Scaling up to 4 pods from 10AM
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: service-scale-up-job
+  namespace: mindbox
+spec:
+  schedule: "0 10 * * 1-5"
+  successfulJobsHistoryLimit: 0
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: sa-cron-runner
+          containers:
+          - name: django-scale-up-job
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/sh
+            - -c
+            - kubectl patch deployments.apps mindbox-deployment --patch '{"spec":{"replicas":4}}'
+          restartPolicy: OnFailure
+---
+# CronJob for scaling down after dayloads
+# Scaling down to 2 pods from 6PM
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: service-scale-down-job
+  namespace: mindbox
+spec:
+  schedule: "0 18 * * 1-5"
+  successfulJobsHistoryLimit: 0
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: sa-cron-runner
+          containers:
+          - name: django-scale-up-job
+            image: bitnami/kubectl:latest
+            command:
+            - /bin/sh
+            - -c
+            - kubectl patch deployments.apps mindbox-deployment --patch '{"spec":{"replicas":2}}'
+          restartPolicy: OnFailure
